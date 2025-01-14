@@ -1,0 +1,13 @@
+service: BULKUP
+provider:
+  name: aws
+  stage: dev
+  region: eu-west-2
+  runtime: nodejs22.x
+  timeout: 180
+functions:
+  app:
+    handler: server.handler
+    events:
+      - http: ANY /
+      - http: 'ANY {proxy+}'
