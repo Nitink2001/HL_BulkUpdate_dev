@@ -45,7 +45,7 @@ const scheduleActionWithEventBridge = async (actionRecord) => {
 exports.createBulkAction = async (req, res, next) => {
 
     const entryAPITime = new Date();
-    const APIName = 'Insert Identity';
+    const APIName = 'Create Bulk Action';
     LoggerModel.Logger('INFO', `[${APIName}] API Entry Time is ${entryAPITime}`);
 
     try {

@@ -15,7 +15,7 @@ exports.createActionRecord = async (action) => {
           Put: {
             TableName: TABLE_NAME,
             Item: {
-              PK: `ACTION#${action.actionId}`,
+              PK: `ACTION#METADATA#${action.actionId}`,
               SK: "METADATA",
               ...action,
             },
@@ -54,7 +54,7 @@ exports.updateActionStatus = async (actionId, status) => {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#METADATA#${actionId}`,
       SK: ActionTypes.METADATA,
     },
     UpdateExpression: "SET #s = :s",
@@ -79,7 +79,7 @@ exports.updateActionStats = async (actionId, successDelta, failureDelta, skipped
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#STATS#${actionId}`,
       SK: ActionTypes.STATISTICS,
     },
     UpdateExpression: `
@@ -104,7 +104,7 @@ exports.getActionRecord = async (actionId, sk) => {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#${sk}#${actionId}`,
       SK: sk,
     },
   };
@@ -120,7 +120,7 @@ exports.getActionLogs = async (actionId) => {
     TableName: TABLE_NAME,
     KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
     ExpressionAttributeValues: {
-      ":pk": `ACTION#${actionId}`,
+      ":pk": `ACTION#LOGS#${actionId}`,
       ":prefix": `${ActionTypes.LOG}#`,
     },
   };
@@ -136,7 +136,7 @@ exports.insertActionLog = async (actionId, log) => {
   const params = {
     TableName: TABLE_NAME,
     Item: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#LOGS#${actionId}`,
       SK: `${ActionTypes.LOG}#${log.logId}`,
       ...log,
     },
@@ -152,7 +152,7 @@ exports.markEmailAsProcessed = async (actionId, email) => {
     const params = {
       TableName: TABLE_NAME,
       Key: {
-        PK: `ACTION#${actionId}`,
+        PK: `ACTION#EMAILS#${actionId}`,
         SK: `PROCESSED_EMAILS`,
       },
       UpdateExpression: "ADD emails :email",
@@ -176,7 +176,7 @@ exports.checkDuplicate = async (actionId, email) => {
     const params = {
       TableName: DYNAMODB_TABLE,
       Key: {
-        PK: `ACTION#${actionId}`,
+        PK: `ACTION#EMAILS#${actionId}`,
         SK: `PROCESSED_EMAILS`,
       },
       ProjectionExpression: "emails",
