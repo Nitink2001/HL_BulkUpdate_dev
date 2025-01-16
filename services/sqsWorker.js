@@ -1,39 +1,48 @@
 
-
-const { rds } = require('../config/awsConfig')
-const { updateActionStats, checkDuplicate, markEmailAsProcessed, updateActionStatus } = require("./dynamoService");
-
-
-
-const MAX_RETRIES = 5;
-const RETRY_DELAY = 100;
-const DYNAMODB_TABLE = process.env.DYNAMODB_TABLE || "BulkActions";
-
-
-const DB_CLUSTER_ARN = process.env.DB_CLUSTER_ARN;
-const DB_SECRET_ARN = process.env.DB_SECRET_ARN;
-const DATABASE_NAME = process.env.DATABASE_NAME;
-
+//This code will be in a different lambda
 /**
- * @param {string} actionId 
- * @param {string} email 
+ * Marks an email as processed in DynamoDB for deduplication.
+ * @param {string} actionId - The ID of the bulk action.
+ * @param {string} email - The email to mark as processed.
  */
 const markEmailAsProcessed = async (actionId, email) => {
-    const params = {
-      TableName: DYNAMODB_TABLE,
-      Key: {
-        PK: `ACTION#${actionId}`,
-        SK: `PROCESSED_EMAILS`,
-      },
-      UpdateExpression: "ADD emails :email",
-      ExpressionAttributeValues: {
-        ":email": dynamoDB.createSet([email]),
-      },
-      ReturnValues: "UPDATED_NEW",
-    };
-  
-    await dynamoDB.update(params).promise();
+  if (!actionId || !email) {
+    throw new Error("Missing required parameters: actionId or email.");
+  }
+
+  const params = {
+    TableName: DYNAMODB_TABLE,
+    Item: {
+      PK: `ACTION#EMAILS#${actionId}`,
+      SK: `PROCESSED_EMAILS#${email}`,
+      GSPK: email, 
+      GSSK: actionId, 
+      Timestamp: new Date().toISOString(),
+    },
+    ConditionExpression: "attribute_not_exists(SK)",
   };
+
+  try {
+    console.log(`Marking email as processed: ${email} for action: ${actionId}`);
+    await dynamoDB.put(params).promise();
+    console.log(`Successfully marked email as processed: ${email}`);
+  } catch (error) {
+    if (error.code === "ConditionalCheckFailedException") {
+      console.warn(`Email ${email} is already marked as processed for action: ${actionId}`);
+    } else if (error.code === "ProvisionedThroughputExceededException") {
+      console.error("DynamoDB throughput exceeded. Consider increasing the table's capacity.");
+    } else if (error.code === "ThrottlingException") {
+      console.error("Request throttled. Retry after a short delay.");
+    } else if (error.code === "ResourceNotFoundException") {
+      console.error(`DynamoDB table not found: ${DYNAMODB_TABLE}`);
+    } else {
+      console.error("Unexpected error while marking email as processed:", error);
+    }
+    throw error;
+  }
+};
+
+
 
 const logAction = async (actionId, eventType, details) => {
   await insertActionLog(actionId, {
@@ -48,7 +57,7 @@ const insertActionLog = async (actionId, log) => {
   const params = {
     TableName: TABLE_NAME,
     Item: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#LOGS#${actionId}`,
       SK: `${ActionTypes.LOG}#${log.logId}`,
       ...log,
     },
@@ -58,44 +67,44 @@ const insertActionLog = async (actionId, log) => {
 
 
 /**
- * @param {string} actionId 
- * @param {string} email 
- * @returns {Promise<boolean>} 
+ * Checks if an email has already been processed for a given action.
+ * Uses DynamoDB for deduplication.
+ * @param {string} actionId - The ID of the bulk action.
+ * @param {string} email - The email to check.
+ * @returns {Promise<boolean>} - True if the email has already been processed, otherwise false.
  */
 const checkDuplicate = async (actionId, email) => {
   const params = {
     TableName: DYNAMODB_TABLE,
-    Key: {
-      PK: `ACTION#${actionId}`,
-      SK: `PROCESSED_EMAILS`,
+    IndexName: "EmailIndex", 
+    KeyConditionExpression: "GSPK = :email AND GSSK = :actionId",
+    ExpressionAttributeValues: {
+      ":email": email,
+      ":actionId": actionId,
     },
-    ProjectionExpression: "emails",
   };
 
   try {
-    const result = await dynamoDB.get(params).promise();
-    const processedEmailsSet = result.Item?.emails;
-
-    // Convert DynamoDB Set to an array
-    const processedEmails = processedEmailsSet ? processedEmailsSet.values : [];
-    return processedEmails.includes(email);
+    const result = await dynamoDB.query(params).promise();
+    return result.Items && result.Items.length > 0;
   } catch (error) {
     console.error("Error checking duplicate:", error);
     throw error;
   }
 };
 
+
 /**
- * @param {string} actionId 
- * @param {number} successDelta 
- * @param {number} failureDelta 
- * @param {number} skippedDelta 
+ * @param {string} actionId - Unique action ID.
+ * @param {number} successDelta - Increment for success count.
+ * @param {number} failureDelta - Increment for failure count.
+ * @param {number} skippedDelta - Increment for skipped count.
  */
 const updateActionStats = async (actionId, successDelta, failureDelta, skippedDelta) => {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#STATISTICS#${actionId}`,
       SK: ActionTypes.STATISTICS,
     },
     UpdateExpression: `
@@ -107,6 +116,7 @@ const updateActionStats = async (actionId, successDelta, failureDelta, skippedDe
       ":sk": skippedDelta,
       ":tp": successDelta + failureDelta + skippedDelta,
     },
+    ConditionExpression: "attribute_exists(PK)",
   };
   await dynamoDB.update(params).promise();
 };
@@ -125,7 +135,11 @@ export const handler = async (event) => {
 
     try {
       for (const entity of records) {
+        
+        let didSucceed = false;
+
         try {
+
           const isDuplicate = await checkDuplicate(actionId, entity.email);
           if (isDuplicate) {
             console.log(`Skipping duplicate email: ${entity.email}`);
@@ -134,27 +148,38 @@ export const handler = async (event) => {
               entity,
               reason: "Duplicate email",
             });
-            continue;
+            continue; 
           }
 
-          await retryWithBackoff(() => updateContactInRDS(entity, entityType, fieldsToUpdate));
+          
+          await retryWithBackoff(() =>
+            updateContactInRDS(entity, entityType, fieldsToUpdate)
+          );
 
           await retryWithBackoff(() =>
             markEmailAsProcessed(actionId, entity.email)
           );
 
-          successCount++;
+          didSucceed = true;
+
+          
           await logAction(actionId, "SUCCESS", {
             entity,
             message: "Entity processed successfully",
           });
+
         } catch (error) {
+          
           console.error("Failed to process entity:", entity, error);
           failureCount++;
           await logAction(actionId, "FAILURE", {
             entity,
             error: error.message,
           });
+        }
+
+        if (didSucceed) {
+          successCount++;
         }
       }
 
@@ -165,11 +190,15 @@ export const handler = async (event) => {
       if (successCount > 0 && failureCount === 0) {
         await retryWithBackoff(() => updateActionStatus(actionId, "COMPLETED"));
       } else if (successCount > 0 && failureCount > 0) {
-        await retryWithBackoff(() => updateActionStatus(actionId, "PARTIALLY_COMPLETED"));
+        await retryWithBackoff(() =>
+          updateActionStatus(actionId, "PARTIALLY_COMPLETED")
+        );
       } else if (successCount === 0 && failureCount > 0) {
         await retryWithBackoff(() => updateActionStatus(actionId, "FAILED"));
       }
+
     } catch (err) {
+      
       console.error("Critical error during batch processing:", err);
       await retryWithBackoff(() => updateActionStatus(actionId, "FAILED"));
       await logAction(actionId, "STATUS_UPDATE", {
@@ -186,11 +215,12 @@ export const handler = async (event) => {
 };
 
 
+
 const updateActionStatus = async (actionId, status) => {
   const params = {
     TableName: TABLE_NAME,
     Key: {
-      PK: `ACTION#${actionId}`,
+      PK: `ACTION#METADATA#${actionId}`,
       SK: ActionTypes.METADATA,
     },
     UpdateExpression: "SET #s = :s",
